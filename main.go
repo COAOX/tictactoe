@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io" // 需要导入 io 包处理 EOF
 	"log"
 	"net"
 	"os"
@@ -29,6 +30,7 @@ const (
 	MsgTypeState  = "state"  // 游戏状态 (轮到谁, 游戏结束等)
 	MsgTypeAssign = "assign" // 分配玩家编号
 	MsgTypeError  = "error"  // 错误消息
+	MsgTypeNotify = "notify" // 通用通知 (例如对方已移动)
 )
 
 // 网络消息结构体
@@ -37,24 +39,45 @@ type Message struct {
 	Player  int    `json:"player"`            // 发送者玩家编号 (1 or 2)
 	X       int    `json:"x,omitempty"`       // 移动的 X 坐标
 	Y       int    `json:"y,omitempty"`       // 移动的 Y 坐标
-	Content string `json:"content,omitempty"` // 聊天内容 或 状态描述 或 错误信息
+	Content string `json:"content,omitempty"` // 聊天内容 或 状态描述 或 错误信息 或通知
 	Turn    int    `json:"turn,omitempty"`    // 当前轮到谁
 	Winner  int    `json:"winner,omitempty"`  // 获胜者 (0: 进行中, 1: Player1, 2: Player2, 3: 平局)
 }
 
 // 游戏状态
 type GameState struct {
-	board         [][]int
-	currentPlayer int
-	winner        int // 0: 进行中, 1: Player1, 2: Player2, 3: 平局
-	gameOver      bool
-	mu            sync.Mutex // 用于保护棋盘和游戏状态的并发访问
-	conn          net.Conn   // 网络连接
-	playerID      int        // 当前实例是玩家1还是玩家2
-	encoder       *json.Encoder
-	decoder       *json.Decoder
-	chatHistory   []string
-	chatMu        sync.Mutex // 保护聊天记录
+	board          [][]int
+	currentPlayer  int
+	winner         int // 0: 进行中, 1: Player1, 2: Player2, 3: 平局
+	gameOver       bool
+	mu             sync.Mutex // 用于保护棋盘和游戏状态的并发访问
+	conn           net.Conn   // 网络连接
+	playerID       int        // 当前实例是玩家1还是玩家2
+	encoder        *json.Encoder
+	decoder        *json.Decoder
+	chatHistory    []string
+	chatMu         sync.Mutex    // 保护聊天记录
+	needsRedraw    bool          // 标记是否需要重新绘制屏幕
+	redrawMu       sync.Mutex    // 保护 needsRedraw
+	inputChan      chan string   // 用于从标准输入读取
+	networkMsgChan chan Message  // 用于从网络读取
+	quitChan       chan struct{} // 用于通知goroutine退出
+}
+
+// 设置需要重绘的标志
+func (gs *GameState) SetNeedsRedraw() {
+	gs.redrawMu.Lock()
+	gs.needsRedraw = true
+	gs.redrawMu.Unlock()
+}
+
+// 检查并重置需要重绘的标志
+func (gs *GameState) CheckAndResetRedraw() bool {
+	gs.redrawMu.Lock()
+	defer gs.redrawMu.Unlock()
+	needs := gs.needsRedraw
+	gs.needsRedraw = false
+	return needs
 }
 
 // --- 游戏逻辑 ---
@@ -68,8 +91,14 @@ func NewBoard(size int) [][]int {
 	return board
 }
 
-// 打印棋盘到控制台
+// 打印棋盘到控制台 (需要加锁)
 func (gs *GameState) DisplayBoard() {
+	gs.mu.Lock()
+	defer gs.mu.Unlock() // 确保函数退出时解锁
+
+	// 清屏 (简单的实现，可能在不同终端效果不同)
+	// fmt.Print("\033[H\033[2J") // ANSI 清屏序列
+
 	fmt.Print("\n   ") // 列号上方留空
 	for j := 0; j < BoardSize; j++ {
 		fmt.Printf("%2d ", j)
@@ -92,14 +121,8 @@ func (gs *GameState) DisplayBoard() {
 			case Player2:
 				fmt.Print(" O ") // 玩家2 使用 O
 			}
-			// fmt.Print("|") // 如果需要格子线
 		}
 		fmt.Printf("|%d\n", i) // 行号
-		// fmt.Print("  +-")
-		// for j := 0; j < BoardSize; j++ {
-		// 	fmt.Print("--+")
-		// }
-		// fmt.Println()
 	}
 	fmt.Print("  +-")
 	for j := 0; j < BoardSize; j++ {
@@ -113,51 +136,23 @@ func (gs *GameState) DisplayBoard() {
 	fmt.Println("\n")
 }
 
-// 检查是否获胜
-func (gs *GameState) CheckWin(player int) bool {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	return checkWinLogic(gs.board, player)
-}
-
-// 检查获胜的核心逻辑 (无锁)
+// 检查是否获胜 (无锁的核心逻辑)
 func checkWinLogic(board [][]int, player int) bool {
 	size := len(board)
-
-	// 检查行、列、对角线是否有五子连珠
 	for i := 0; i < size; i++ {
 		for j := 0; j < size; j++ {
 			if board[i][j] == player {
-				// 检查水平方向
-				if j+4 < size &&
-					board[i][j+1] == player &&
-					board[i][j+2] == player &&
-					board[i][j+3] == player &&
-					board[i][j+4] == player {
+				// 水平, 垂直, 对角线检查 (同前)
+				if j+4 < size && board[i][j+1] == player && board[i][j+2] == player && board[i][j+3] == player && board[i][j+4] == player {
 					return true
 				}
-				// 检查垂直方向
-				if i+4 < size &&
-					board[i+1][j] == player &&
-					board[i+2][j] == player &&
-					board[i+3][j] == player &&
-					board[i+4][j] == player {
+				if i+4 < size && board[i+1][j] == player && board[i+2][j] == player && board[i+3][j] == player && board[i+4][j] == player {
 					return true
 				}
-				// 检查主对角线 (\)
-				if i+4 < size && j+4 < size &&
-					board[i+1][j+1] == player &&
-					board[i+2][j+2] == player &&
-					board[i+3][j+3] == player &&
-					board[i+4][j+4] == player {
+				if i+4 < size && j+4 < size && board[i+1][j+1] == player && board[i+2][j+2] == player && board[i+3][j+3] == player && board[i+4][j+4] == player {
 					return true
 				}
-				// 检查副对角线 (/)
-				if i+4 < size && j-4 >= 0 &&
-					board[i+1][j-1] == player &&
-					board[i+2][j-2] == player &&
-					board[i+3][j-3] == player &&
-					board[i+4][j-4] == player {
+				if i+4 < size && j-4 >= 0 && board[i+1][j-1] == player && board[i+2][j-2] == player && board[i+3][j-3] == player && board[i+4][j-4] == player {
 					return true
 				}
 			}
@@ -166,49 +161,39 @@ func checkWinLogic(board [][]int, player int) bool {
 	return false
 }
 
-// 检查是否平局 (棋盘满了)
-func (gs *GameState) CheckDraw() bool {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-	return checkDrawLogic(gs.board)
-}
-
-// 检查平局的核心逻辑 (无锁)
+// 检查是否平局 (无锁的核心逻辑)
 func checkDrawLogic(board [][]int) bool {
 	for i := 0; i < len(board); i++ {
 		for j := 0; j < len(board[i]); j++ {
 			if board[i][j] == Empty {
-				return false // 还有空位，不是平局
+				return false
 			}
 		}
 	}
-	return true // 棋盘已满
+	return true
 }
 
-// 尝试落子
-func (gs *GameState) PlacePiece(x, y, player int) bool {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
+// 尝试落子 (需要在外部加锁调用)
+func (gs *GameState) placePieceInternal(x, y, player int) bool {
 	if x < 0 || x >= BoardSize || y < 0 || y >= BoardSize || gs.board[x][y] != Empty {
-		return false // 无效位置或已有棋子
+		return false
 	}
 	gs.board[x][y] = player
 	return true
 }
 
-// 添加聊天消息
+// 添加聊天消息 (需要加锁)
 func (gs *GameState) AddChatMessage(sender string, message string) {
 	gs.chatMu.Lock()
 	defer gs.chatMu.Unlock()
 	gs.chatHistory = append(gs.chatHistory, fmt.Sprintf("[%s]: %s", sender, message))
-	// 可以限制聊天记录的长度
 	const maxChatHistory = 20
 	if len(gs.chatHistory) > maxChatHistory {
 		gs.chatHistory = gs.chatHistory[len(gs.chatHistory)-maxChatHistory:]
 	}
 }
 
-// 显示聊天记录
+// 显示聊天记录 (需要加锁)
 func (gs *GameState) DisplayChat() {
 	gs.chatMu.Lock()
 	defer gs.chatMu.Unlock()
@@ -225,134 +210,351 @@ func (gs *GameState) DisplayChat() {
 
 // --- 网络处理 ---
 
-// 发送消息
+// 发送消息 (不在锁内调用)
 func (gs *GameState) SendMessage(msg Message) error {
-	// 发送消息前确保连接存在
 	if gs.conn == nil {
 		return fmt.Errorf("no connection established")
 	}
-	// log.Printf("DEBUG: Sending message: %+v\n", msg) // 调试日志
+	// log.Printf("DEBUG: Sending message: %+v\n", msg)
+	// 对网络连接的写操作本身应该是线程安全的，但最好还是避免并发写同一个 encoder
+	// 如果担心并发写 encoder，可以在这里加一个单独的发送锁
 	err := gs.encoder.Encode(msg)
 	if err != nil {
 		log.Printf("Error sending message: %v", err)
-		// 考虑在这里处理连接断开的情况
-		gs.gameOver = true // 假设连接错误导致游戏结束
+		// 触发游戏结束流程
+		close(gs.quitChan) // 通知其他 goroutine 退出
 	}
 	return err
 }
 
-// 接收消息并处理 (在一个单独的 goroutine 中运行)
-func (gs *GameState) ReceiveMessages() {
+// Goroutine: 接收网络消息并发送到 channel
+func (gs *GameState) networkReceiver() {
+	defer func() {
+		// 如果接收循环退出（例如连接断开），也通知主循环
+		log.Println("Network receiver exiting.")
+		select {
+		case <-gs.quitChan: // 检查是否已经关闭
+		default:
+			close(gs.quitChan)
+		}
+	}()
+
 	if gs.conn == nil {
 		log.Println("Cannot receive messages: no connection")
 		return
 	}
 
 	for {
+		select {
+		case <-gs.quitChan: // 检查是否需要退出
+			log.Println("Network receiver received quit signal.")
+			return
+		default:
+			// 继续尝试读取
+		}
+
 		var msg Message
 		err := gs.decoder.Decode(&msg)
 		if err != nil {
-			// log.Printf("Error receiving message: %v. Opponent likely disconnected.", err)
-			fmt.Println("\nConnection lost. Opponent may have disconnected.")
-			gs.mu.Lock()
-			gs.gameOver = true // 标记游戏结束
-			gs.mu.Unlock()
-			gs.conn.Close() // 关闭连接
-			// 通知主循环退出 (例如通过 channel)
-			// close(someChannel) // 如果使用了 channel
-			os.Exit(1) // 或者直接退出
+			// 区分 EOF 和其他错误
+			if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
+				log.Printf("Connection closed by peer or locally.")
+			} else {
+				log.Printf("Error receiving message: %v.", err)
+			}
+			// 不论什么错误，都通知退出
+			select {
+			case <-gs.quitChan:
+			default:
+				close(gs.quitChan)
+			}
 			return
 		}
+		// log.Printf("DEBUG: Received raw message: %+v\n", msg)
 
-		// log.Printf("DEBUG: Received message: %+v\n", msg) // 调试日志
+		// 发送到 channel，让主循环处理
+		select {
+		case gs.networkMsgChan <- msg:
+			// log.Printf("DEBUG: Sent message to networkMsgChan: %+v\n", msg)
+		case <-gs.quitChan:
+			log.Println("Network receiver shutting down while sending to channel.")
+			return
+		}
+	}
+}
 
-		gs.mu.Lock() // 加锁保护状态修改
+// Goroutine: 从标准输入读取并发送到 channel
+func (gs *GameState) inputReader() {
+	defer func() {
+		log.Println("Input reader exiting.")
+		// 如果输入退出（例如Ctrl+D），也通知主循环
+		select {
+		case <-gs.quitChan:
+		default:
+			close(gs.quitChan)
+		}
+	}()
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		select {
+		case <-gs.quitChan: // 检查是否需要退出
+			log.Println("Input reader received quit signal.")
+			return
+		default:
+			// 继续尝试读取
+		}
+
+		// log.Println("DEBUG: Input reader waiting for input...")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Input stream closed (EOF).")
+			} else {
+				log.Printf("Error reading input: %v", err)
+			}
+			// 通知退出
+			select {
+			case <-gs.quitChan:
+			default:
+				close(gs.quitChan)
+			}
+			return
+		}
+		// log.Printf("DEBUG: Read input: %s", input)
+		// 发送到 channel
+		select {
+		case gs.inputChan <- strings.TrimSpace(input):
+			// log.Printf("DEBUG: Sent input to inputChan: %s", strings.TrimSpace(input))
+		case <-gs.quitChan:
+			log.Println("Input reader shutting down while sending to channel.")
+			return
+		}
+	}
+}
+
+// 处理网络消息 (在主循环中调用)
+func (gs *GameState) handleNetworkMessage(msg Message) {
+	// log.Printf("DEBUG: Handling network message: %+v\n", msg)
+	var opponentMoved = false
+	var chatReceived = false
+	var stateChanged = false
+	var senderName = fmt.Sprintf("Player %d", msg.Player) // 默认显示对方编号
+
+	gs.mu.Lock()     //加锁保护状态修改
+	if gs.gameOver { // 如果游戏已经结束，不再处理大部分消息
+		gs.mu.Unlock()
+		if msg.Type == MsgTypeChat { // 但仍然可以接收聊天消息
+			gs.AddChatMessage(senderName, msg.Content)
+			chatReceived = true
+		} else {
+			log.Printf("INFO: Ignoring message type %s because game is over.", msg.Type)
+		}
+		// return // 如果不处理聊天，可以直接返回
+	} else { // 游戏进行中
 		switch msg.Type {
 		case MsgTypeMove:
 			if msg.Player != gs.playerID && gs.currentPlayer == msg.Player {
-				// 对方的移动
-				if gs.PlacePiece(msg.X, msg.Y, msg.Player) {
-					fmt.Printf("\nOpponent (Player %d) placed at (%d, %d)\n", msg.Player, msg.X, msg.Y)
-					gs.DisplayBoard() // 更新棋盘显示
-
+				valid := gs.placePieceInternal(msg.X, msg.Y, msg.Player)
+				if valid {
+					opponentMoved = true // 标记对方移动成功
 					// 检查对方是否获胜或平局
 					if checkWinLogic(gs.board, msg.Player) {
 						gs.winner = msg.Player
 						gs.gameOver = true
-						fmt.Printf("\nPlayer %d wins!\n", msg.Player)
+						stateChanged = true
 					} else if checkDrawLogic(gs.board) {
 						gs.winner = 3 // 平局
 						gs.gameOver = true
-						fmt.Println("\nIt's a draw!")
+						stateChanged = true
 					} else {
 						gs.currentPlayer = gs.playerID // 轮到自己
+						stateChanged = true
 					}
 				} else {
 					log.Printf("Received invalid move from opponent: (%d, %d)", msg.X, msg.Y)
-					// 可以选择发送错误消息回去，或者断开连接
+					// 可以选择发送错误消息回去
+					gs.mu.Unlock() // 发送消息前解锁
 					gs.SendMessage(Message{Type: MsgTypeError, Content: "Received invalid move"})
+					gs.mu.Lock() // 重新锁定以便继续
 				}
 			} else if msg.Player == gs.playerID {
-				// 忽略自己发送的移动回显（理论上不应该收到）
+				// 忽略自己发送的移动回显
 			} else {
 				log.Printf("WARN: Received move from player %d, but current turn is %d", msg.Player, gs.currentPlayer)
-				// 忽略非当前玩家的移动消息
 			}
 		case MsgTypeChat:
-			senderName := fmt.Sprintf("Player %d", msg.Player)
-			if msg.Player == gs.playerID {
-				senderName = "You" // 可以显示为 "You"
+			if msg.Player != gs.playerID { // 只记录和显示对方的消息
+				gs.mu.Unlock() // AddChatMessage 有自己的锁
+				gs.AddChatMessage(senderName, msg.Content)
+				gs.mu.Lock() // 重新锁定
+				chatReceived = true
 			}
-			gs.AddChatMessage(senderName, msg.Content)
-			// 在主循环中或其他地方定期显示聊天记录，或者立即显示
-			fmt.Printf("\n[%s]: %s\n", senderName, msg.Content)
-			// 提示用户继续输入
-			fmt.Printf("Your turn (Player %d). Enter move (x,y) or chat (/c message): ", gs.playerID)
-
 		case MsgTypeState:
-			// 通常由服务器发送给客户端，更新游戏状态
 			gs.currentPlayer = msg.Turn
 			gs.winner = msg.Winner
 			gs.gameOver = (msg.Winner != 0)
+			stateChanged = true
 			if gs.gameOver {
-				fmt.Println("\nGame Over received from remote.")
-				if msg.Winner == 3 {
-					fmt.Println("It's a draw!")
-				} else if msg.Winner != 0 {
-					fmt.Printf("Player %d wins!\n", msg.Winner)
-				}
+				log.Println("INFO: Received game over state from remote.")
 			}
-			// 可能还需要更新棋盘状态（如果状态消息包含棋盘）
 		case MsgTypeAssign:
-			// 客户端接收服务器分配的玩家编号
-			if gs.playerID == 0 { // 确保只分配一次
+			if gs.playerID == 0 {
 				gs.playerID = msg.Player
-				fmt.Printf("You are Player %d\n", gs.playerID)
-				// 如果自己是玩家2，通常开始时是玩家1先走
-				if gs.playerID == Player2 {
+				log.Printf("INFO: Assigned player ID: %d\n", gs.playerID)
+				stateChanged = true
+				// 初始化回合
+				if gs.playerID == Player1 {
 					gs.currentPlayer = Player1
-					fmt.Println("Waiting for Player 1's move...")
 				} else {
-					gs.currentPlayer = Player1                         // 服务器（玩家1）总是先开始
-					fmt.Printf("Waiting for Player 2 to connect...\n") // 服务器等待客户端连接后的消息
+					gs.currentPlayer = Player1 // 客户端等待P1先手
 				}
 			}
 		case MsgTypeError:
 			log.Printf("Received error from opponent: %s", msg.Content)
-			// 可以根据错误类型决定是否结束游戏
-			// fmt.Println("\nReceived error:", msg.Content)
-			// gs.gameOver = true // 例如，某些错误可能导致游戏结束
-
+			// 可能需要根据错误类型设置 gameOver
+			stateChanged = true // 至少日志变了，可能需要重绘
+		case MsgTypeNotify:
+			// 可以用来处理一些不需要锁的操作或简单通知
+			log.Printf("INFO: Received notification: %s", msg.Content)
+			stateChanged = true // 可能需要重绘以显示通知或日志
 		default:
 			log.Printf("Received unknown message type: %s", msg.Type)
 		}
-		gs.mu.Unlock() // 解锁
+	}
+	gs.mu.Unlock() // 解锁
 
-		// 如果游戏结束，可以退出接收循环
-		if gs.gameOver {
-			// fmt.Println("Receive loop ending due to game over.") // Debug
-			return
+	// 根据处理结果，决定是否需要重绘屏幕
+	if opponentMoved || chatReceived || stateChanged {
+		gs.SetNeedsRedraw()
+	}
+	if gs.gameOver {
+		// 游戏结束后，确保通知所有 goroutine 退出
+		select {
+		case <-gs.quitChan:
+		default:
+			close(gs.quitChan)
 		}
+	}
+}
+
+// 处理用户输入 (在主循环中调用)
+func (gs *GameState) handleUserInput(input string) {
+	gs.mu.Lock() // 需要读取 playerID 和 currentPlayer
+	myPlayerID := gs.playerID
+	myTurn := (myPlayerID != 0) && (gs.currentPlayer == myPlayerID) && !gs.gameOver
+	isGameOver := gs.gameOver // Read game over state too
+	gs.mu.Unlock()
+
+	if myPlayerID == 0 {
+		fmt.Println("Still waiting for player assignment. Input ignored.")
+		gs.SetNeedsRedraw() // Need to redraw to potentially clear the invalid input prompt
+		return
+	}
+
+	if isGameOver {
+		fmt.Println("Game is over. Input ignored.")
+		gs.SetNeedsRedraw()
+		return
+	}
+
+	if !myTurn {
+		fmt.Println("It's not your turn.")
+		gs.SetNeedsRedraw() // 可能需要重绘以清除输入提示
+		return
+	}
+
+	var messageToSend *Message = nil // 指针，以便知道是否需要发送
+	var localChatMsg string = ""     // 用于本地显示自己的聊天
+
+	if strings.HasPrefix(input, "/c ") {
+		// --- 处理聊天输入 ---
+		chatMsg := strings.TrimPrefix(input, "/c ")
+		if chatMsg != "" {
+			localChatMsg = chatMsg // 记录本地消息内容
+			messageToSend = &Message{
+				Type:    MsgTypeChat,
+				Player:  myPlayerID,
+				Content: chatMsg,
+			}
+		}
+	} else {
+		// --- 处理移动输入 ---
+		parts := strings.Split(input, ",")
+		if len(parts) == 2 {
+			xStr, yStr := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			x, errX := strconv.Atoi(xStr)
+			y, errY := strconv.Atoi(yStr)
+
+			if errX == nil && errY == nil {
+				var validMove, win, draw bool
+				var nextPlayer int
+
+				gs.mu.Lock()                                        // --- 开始临界区 ---
+				if gs.currentPlayer == myPlayerID && !gs.gameOver { // 再次检查，防止状态变化
+					validMove = gs.placePieceInternal(x, y, myPlayerID)
+					if validMove {
+						win = checkWinLogic(gs.board, myPlayerID)
+						draw = checkDrawLogic(gs.board)
+						if win {
+							gs.winner = myPlayerID
+							gs.gameOver = true
+						} else if draw {
+							gs.winner = 3
+							gs.gameOver = true
+						} else {
+							gs.currentPlayer = 3 - myPlayerID // 切换回合
+							nextPlayer = gs.currentPlayer
+						}
+					}
+				}
+				gs.mu.Unlock() // --- 结束临界区 ---
+
+				if validMove {
+					// 准备发送移动消息
+					messageToSend = &Message{
+						Type:   MsgTypeMove,
+						Player: myPlayerID,
+						X:      x,
+						Y:      y,
+					}
+					gs.SetNeedsRedraw() // 自己移动了，需要重绘
+
+					// 如果游戏因这次移动而结束，也发送最终状态
+					if win || draw {
+						log.Println("INFO: Game over after my move.")
+						go gs.SendMessage(Message{Type: MsgTypeState, Winner: gs.winner, Turn: 0}) // 异步发送结束状态
+						// 确保退出
+						select {
+						case <-gs.quitChan:
+						default:
+							close(gs.quitChan)
+						}
+					} else {
+						log.Printf("INFO: My move successful, next turn: Player %d\n", nextPlayer)
+					}
+				} else {
+					fmt.Println("Invalid move. Try again.")
+					gs.SetNeedsRedraw()
+				}
+			} else {
+				fmt.Println("Invalid input format. Use x,y for moves (e.g., 7,7).")
+				gs.SetNeedsRedraw()
+			}
+		} else {
+			fmt.Println("Invalid input format. Use x,y for moves or /c <message>.")
+			gs.SetNeedsRedraw()
+		}
+	}
+
+	// 发送消息（如果需要） - 在锁外执行
+	if messageToSend != nil {
+		go gs.SendMessage(*messageToSend) // 异步发送，避免阻塞主循环
+	}
+
+	// 如果是本地聊天消息，添加到聊天记录 - 在锁外执行
+	if localChatMsg != "" {
+		gs.AddChatMessage(fmt.Sprintf("You (Player %d)", myPlayerID), localChatMsg)
+		gs.SetNeedsRedraw() // 需要重绘聊天区
 	}
 }
 
@@ -364,217 +566,152 @@ func main() {
 	flag.Parse()
 
 	gs := &GameState{
-		board:         NewBoard(BoardSize),
-		currentPlayer: Player1, // 默认玩家1先手
-		winner:        0,
-		gameOver:      false,
-		playerID:      0, // 初始未知
-		chatHistory:   make([]string, 0),
+		board:          NewBoard(BoardSize),
+		currentPlayer:  0, // 等待分配
+		winner:         0,
+		gameOver:       false,
+		playerID:       0,
+		chatHistory:    make([]string, 0),
+		needsRedraw:    true,                   // 初始需要绘制
+		inputChan:      make(chan string, 1),   // 带缓冲，避免输入时阻塞发送者
+		networkMsgChan: make(chan Message, 10), // 带缓冲，处理突发消息
+		quitChan:       make(chan struct{}),    // 用于关闭信号
 	}
 
 	var listener net.Listener
+	var conn net.Conn
 	var err error
 
-	// 根据命令行参数决定作为服务器还是客户端
+	// --- 设置网络连接 ---
+	isServer := false
 	if *listenAddr != "" {
-		// --- 服务器模式 ---
+		isServer = true
 		fmt.Println("Starting server on", *listenAddr)
 		listener, err = net.Listen("tcp", *listenAddr)
 		if err != nil {
 			log.Fatalf("Failed to listen: %v", err)
 		}
 		defer listener.Close()
-
 		fmt.Println("Waiting for opponent to connect...")
-		conn, err := listener.Accept()
+		conn, err = listener.Accept()
 		if err != nil {
 			log.Fatalf("Failed to accept connection: %v", err)
 		}
 		fmt.Println("Opponent connected from", conn.RemoteAddr())
-		gs.conn = conn        // 保存连接
-		gs.playerID = Player1 // 服务器是玩家1
-		gs.encoder = json.NewEncoder(conn)
-		gs.decoder = json.NewDecoder(conn)
-
-		// 向客户端发送分配信息
-		err = gs.SendMessage(Message{Type: MsgTypeAssign, Player: Player2})
-		if err != nil {
-			log.Printf("Failed to send assign message: %v", err)
-			return // or handle error appropriately
-		}
-		fmt.Println("Assigned Player 2 to the client.")
-		gs.currentPlayer = Player1 // 确认服务器先手
-
 	} else if *connectAddr != "" {
-		// --- 客户端模式 ---
 		fmt.Println("Connecting to server at", *connectAddr)
-		conn, err := net.DialTimeout("tcp", *connectAddr, 10*time.Second) // 增加超时
+		conn, err = net.DialTimeout("tcp", *connectAddr, 10*time.Second)
 		if err != nil {
 			log.Fatalf("Failed to connect: %v", err)
 		}
 		fmt.Println("Connected to server.")
-		gs.conn = conn // 保存连接
-		gs.encoder = json.NewEncoder(conn)
-		gs.decoder = json.NewDecoder(conn)
-		// 客户端需要等待服务器分配 PlayerID (在 ReceiveMessages 中处理)
-		fmt.Println("Waiting for player assignment from server...")
-
 	} else {
 		fmt.Println("Please specify either --listen <addr> or --connect <addr>")
 		os.Exit(1)
 	}
+	fmt.Println("Connection established.")
+	gs.conn = conn // 保存连接
+	gs.encoder = json.NewEncoder(conn)
+	gs.decoder = json.NewDecoder(conn)
 	defer gs.conn.Close() // 确保连接最终关闭
 
-	// 启动一个 goroutine 持续接收和处理来自对方的消息
-	go gs.ReceiveMessages()
+	// 启动 I/O goroutines
+	go gs.networkReceiver()
+	go gs.inputReader()
 
-	// 等待玩家ID分配完成 (尤其是客户端)
-	for gs.playerID == 0 {
-		time.Sleep(100 * time.Millisecond) // 等待分配消息
+	// --- 初始化玩家 (服务器发送分配) ---
+	if isServer {
 		gs.mu.Lock()
-		gameOverCheck := gs.gameOver // 检查是否在等待期间连接就断了
+		gs.playerID = Player1
+		gs.currentPlayer = Player1 // 服务器先手
 		gs.mu.Unlock()
-		if gameOverCheck {
-			fmt.Println("Connection closed while waiting for player assignment.")
-			return
-		}
+		fmt.Println("You are Player 1 (X). Your turn.")
+		assignMsg := Message{Type: MsgTypeAssign, Player: Player2}
+		go gs.SendMessage(assignMsg) // 异步发送分配消息
+		gs.SetNeedsRedraw()
+	} else {
+		fmt.Println("Waiting for player assignment from server...")
+		// 等待 Assign 消息在主循环中处理
 	}
 
-	// --- 主游戏循环 ---
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		gs.mu.Lock() // 读取状态前加锁
-		if gs.gameOver {
-			gs.mu.Unlock() // 检查完 gameOver 后解锁
-			break
-		}
-		currentTurnPlayer := gs.currentPlayer
-		myTurn := (currentTurnPlayer == gs.playerID)
-		myPlayerID := gs.playerID
-		gs.mu.Unlock() // 读取完状态后解锁
+	// --- 主事件循环 ---
+	ticker := time.NewTicker(100 * time.Millisecond) // 定期检查重绘
+	defer ticker.Stop()
 
-		// 显示棋盘和聊天记录
-		gs.DisplayBoard()
-		gs.DisplayChat()
+	running := true
+	for running {
 
-		if myTurn {
-			fmt.Printf("Your turn (Player %d). Enter move (x,y) or chat (/c message): ", myPlayerID)
-			input, _ := reader.ReadString('\n')
-			input = strings.TrimSpace(input)
+		// 检查是否需要重绘并执行
+		if gs.CheckAndResetRedraw() {
+			// 在绘制前获取最新状态 (避免在锁内绘制)
+			gs.mu.Lock()
+			myPlayerID := gs.playerID
+			currentTurnPlayer := gs.currentPlayer
+			isMyTurn := (currentTurnPlayer == myPlayerID) && !gs.gameOver
+			isGameOver := gs.gameOver
+			gs.mu.Unlock()
 
-			if strings.HasPrefix(input, "/c ") {
-				// --- 处理聊天输入 ---
-				chatMsg := strings.TrimPrefix(input, "/c ")
-				if chatMsg != "" {
-					// 1. 添加到本地聊天记录
-					gs.AddChatMessage(fmt.Sprintf("You (Player %d)", myPlayerID), chatMsg)
-					// 2. 发送给对方
-					sendErr := gs.SendMessage(Message{
-						Type:    MsgTypeChat,
-						Player:  myPlayerID,
-						Content: chatMsg,
-					})
-					if sendErr != nil {
-						fmt.Println("Failed to send chat message:", sendErr)
-						// 可以在这里决定是否因发送失败而结束游戏
-					}
-					// 显示更新后的聊天记录
-					// gs.DisplayChat() // DisplayBoard() 之后会显示，避免重复
+			// 清屏或滚动以显示最新状态
+			fmt.Print("\033[H\033[2J") // ANSI 清屏 - 可选
+
+			gs.DisplayBoard()
+			gs.DisplayChat()
+
+			if isGameOver {
+				gs.mu.Lock()
+				winner := gs.winner
+				gs.mu.Unlock()
+				fmt.Println("--- GAME OVER ---")
+				switch winner {
+				case Player1:
+					fmt.Println("Player 1 (X) wins!")
+				case Player2:
+					fmt.Println("Player 2 (O) wins!")
+				case 3:
+					fmt.Println("It's a draw!")
+				default:
+					fmt.Println("Game ended.") // 可能因断线
+				}
+				fmt.Println("Press Ctrl+C or close the window to exit.")
+				// running = false // 可以直接在这里退出循环，或者等待 quitChan
+			} else if myPlayerID != 0 { // 确保已分配 ID
+				if isMyTurn {
+					fmt.Printf("Your turn (Player %d). Enter move (x,y) or chat (/c message): ", myPlayerID)
+				} else {
+					fmt.Printf("Waiting for Player %d's move...\n", currentTurnPlayer)
 				}
 			} else {
-				// --- 处理移动输入 ---
-				parts := strings.Split(input, ",")
-				if len(parts) == 2 {
-					xStr, yStr := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-					x, errX := strconv.Atoi(xStr)
-					y, errY := strconv.Atoi(yStr)
-
-					if errX == nil && errY == nil {
-						gs.mu.Lock() // 修改棋盘前加锁
-						validMove := gs.PlacePiece(x, y, myPlayerID)
-						gs.mu.Unlock() // 修改棋盘后解锁
-
-						if validMove {
-							fmt.Printf("You placed at (%d, %d)\n", x, y)
-							// 发送移动给对方
-							sendErr := gs.SendMessage(Message{
-								Type:   MsgTypeMove,
-								Player: myPlayerID,
-								X:      x,
-								Y:      y,
-							})
-							if sendErr != nil {
-								fmt.Println("Failed to send move:", sendErr)
-								gs.mu.Lock()
-								gs.gameOver = true // 发送失败，游戏结束
-								gs.mu.Unlock()
-								continue // 跳过胜负检查，直接进入下一轮循环检查 gameOver
-							}
-
-							// 检查自己是否获胜或平局
-							gs.mu.Lock() // 检查胜负前加锁
-							if checkWinLogic(gs.board, myPlayerID) {
-								gs.winner = myPlayerID
-								gs.gameOver = true
-								gs.DisplayBoard() // 显示最终棋盘
-								fmt.Println("\nCongratulations! You win!")
-								// 可以选择发送最终状态给对方
-								gs.SendMessage(Message{Type: MsgTypeState, Winner: myPlayerID, Turn: 0})
-							} else if checkDrawLogic(gs.board) {
-								gs.winner = 3 // 平局
-								gs.gameOver = true
-								gs.DisplayBoard() // 显示最终棋盘
-								fmt.Println("\nIt's a draw!")
-								// 发送平局状态
-								gs.SendMessage(Message{Type: MsgTypeState, Winner: 3, Turn: 0})
-							} else {
-								// 切换回合
-								gs.currentPlayer = 3 - myPlayerID // 切换到另一个玩家
-								fmt.Printf("Waiting for Player %d's move...\n", gs.currentPlayer)
-							}
-							gs.mu.Unlock() // 检查胜负后解锁
-
-						} else {
-							fmt.Println("Invalid move. Try again.")
-						}
-					} else {
-						fmt.Println("Invalid input format. Use x,y for moves (e.g., 7,7) or /c <message> for chat.")
-					}
-				} else {
-					fmt.Println("Invalid input format. Use x,y for moves (e.g., 7,7) or /c <message> for chat.")
-				}
+				fmt.Println("Connecting and waiting for player assignment...")
 			}
-		} else {
-			// 不是我的回合，等待对方移动 (ReceiveMessages goroutine 会处理)
-			// fmt.Printf("Waiting for Player %d's move...\n", currentTurnPlayer) // 可以在ReceiveMessages中打印提示
-			time.Sleep(500 * time.Millisecond) // 短暂休眠避免CPU空转
 		}
 
-		// 短暂休眠，避免在对方回合时过于频繁地检查状态和重绘屏幕
-		if !myTurn {
-			time.Sleep(200 * time.Millisecond)
+		// 使用 select 处理不同的事件源
+		select {
+		case input := <-gs.inputChan:
+			// log.Println("DEBUG: Main loop received input:", input)
+			if input != "" { // 忽略空输入
+				gs.handleUserInput(input)
+			} else {
+				gs.SetNeedsRedraw() // 空输入也可能需要重置提示
+			}
+
+		case msg := <-gs.networkMsgChan:
+			// log.Println("DEBUG: Main loop received network message:", msg.Type)
+			gs.handleNetworkMessage(msg)
+
+		case <-ticker.C:
+			// 定期检查，主要是为了在没有其他事件时也能触发重绘检查
+			// log.Println("DEBUG: Tick.") // 非常频繁，调试时才打开
+			continue // 继续循环以检查 needsRedraw
+
+		case <-gs.quitChan:
+			fmt.Println("\nReceived quit signal. Exiting main loop.")
+			running = false // 退出循环
 		}
+	} // end main loop
 
-	} // end game loop
-
-	fmt.Println("Game Over.")
-	// 可以在这里添加最终的胜负信息显示
-	gs.mu.Lock()
-	winner := gs.winner
-	gs.mu.Unlock()
-	switch winner {
-	case Player1:
-		fmt.Println("Player 1 won!")
-	case Player2:
-		fmt.Println("Player 2 won!")
-	case 3:
-		fmt.Println("The game is a draw!")
-	default:
-		// 可能因为连接断开等原因结束
-		fmt.Println("Game ended unexpectedly.")
-
-	}
-	// 等待用户按 Enter 键退出，以便查看最终结果
-	fmt.Println("Press Enter to exit.")
-	reader.ReadString('\n')
+	fmt.Println("Shutting down.")
+	// (连接已通过 defer 关闭)
+	// 等待用户查看最终信息
+	time.Sleep(2 * time.Second) // 短暂等待，让用户看到结束信息
 }
